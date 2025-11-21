@@ -1,0 +1,39 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual environments
+.env/
+.venv/
+venv/
+ENV/
+
+# Jupyter & notebooks cache
+.ipynb_checkpoints/
+
+# Data & generated artifacts (keep minimal examples)
+radar_project/data/trainval/images/
+radar_project/data/trainval/npy/
+radar_project/data/test/images/
+radar_project/data/test/npy/
+radar_project/data/hidden_eval/
+radar_project/exports/
+
+# Models (retain .joblib but ignore large experimental variants)
+radar_project/models/*.tmp
+
+# Streamlit cache
+.streamlit/
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# VSCode
+.vscode/

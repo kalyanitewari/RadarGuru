@@ -1,0 +1,18 @@
+{
+  "samples_per_class": 50,
+  "total_samples": 100,
+  "accuracy": 0.55,
+  "confusion_matrix": [
+    [
+      50,
+      0
+    ],
+    [
+      45,
+      5
+    ]
+  ],
+  "roc_auc": 0.746,
+  "average_precision": 0.788,
+  "notes": "Baseline before adding hidden samples to training or threshold tuning."
+}

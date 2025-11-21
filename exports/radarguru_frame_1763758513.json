@@ -1,0 +1,10 @@
+{
+  "scenario": "metal_object",
+  "metal_flag": true,
+  "clutter_level": 0.15,
+  "snr_db": 18,
+  "probability": 0.0,
+  "threshold_used": 0.5,
+  "decision": "non-metal",
+  "model": "No models"
+}
