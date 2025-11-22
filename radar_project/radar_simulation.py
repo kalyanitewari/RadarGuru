@@ -1,17 +1,7 @@
 """
-radar_simulation.py
 
 Helper functions to generate synthetic 1D/2D radar-like signals and heatmaps.
-Provides dataset generation utilities used by the notebooks.
 
-Functions:
-- generate_range_doppler_heatmap(...)
-- generate_range_profile(...)
-- generate_doppler_spectrum(...)
-- apply_fft(...)
-- visualize_heatmap(...)
-- generate_dataset(...)
-- denoise_background_subtract(...)
 
 """
 
@@ -285,6 +275,55 @@ def extract_features(raw_heatmap, processed_heatmap=None, k_top=10):
     if k < k_top:
         feats += [0.0]*(k_top - k)
     return np.array(feats, dtype=float)
+
+def hidden_stripe_score(processed_heatmap):
+    """Heuristic score for a faint horizontal metallic stripe.
+
+    Steps:
+    - Row mean profile (after background subtraction) captures horizontal band energy.
+    - Smooth with gaussian to suppress pixel noise.
+    - Peak z-score: (max - mean) / std indicates prominence of any band.
+    - Band length fraction: longest contiguous set of rows above mean+0.5*std.
+    - Contrast: peak minus local neighborhood average normalized by std.
+
+    Final score: weighted combination scaled into ~[0,5+] (no strict bound).
+    Returned dict includes components plus composite 'score'.
+    """
+    proc = processed_heatmap.astype(float)
+    row_mean = proc.mean(axis=1)
+    smooth = ndimage.gaussian_filter1d(row_mean, sigma=2)
+    g_mean = float(smooth.mean())
+    g_std = float(smooth.std() + 1e-6)
+    peak_val = float(smooth.max())
+    peak_z = (peak_val - g_mean) / g_std
+    # Band length over threshold
+    thr = g_mean + 0.5 * g_std
+    above = smooth > thr
+    # Longest contiguous run
+    max_run = 0
+    cur = 0
+    for v in above:
+        if v:
+            cur += 1
+            max_run = max(max_run, cur)
+        else:
+            cur = 0
+    band_frac = max_run / smooth.shape[0]
+    # Local contrast ignoring a window around peak
+    peak_idx = int(np.argmax(smooth))
+    left = max(0, peak_idx - 3)
+    right = min(smooth.shape[0], peak_idx + 4)
+    neighbor_vals = np.concatenate([smooth[:left], smooth[right:]]) if (left > 0 or right < smooth.shape[0]) else smooth
+    neighbor_mean = float(neighbor_vals.mean()) if neighbor_vals.size else g_mean
+    contrast = (peak_val - neighbor_mean) / g_std
+    # Composite
+    score = 0.5 * peak_z + 0.3 * (band_frac * 10) + 0.2 * contrast
+    return {
+        'peak_z': float(peak_z),
+        'band_frac': float(band_frac),
+        'contrast': float(contrast),
+        'score': float(score)
+    }
 
 if __name__ == '__main__':
     # Non-blocking demo CLI

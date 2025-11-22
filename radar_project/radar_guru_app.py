@@ -21,12 +21,14 @@ from radar_simulation import (
     generate_range_doppler_heatmap,
     denoise_background_subtract,
     extract_features,
+    hidden_stripe_score,
 )
 import joblib
 
 importlib.reload(radar_simulation)
 
-MODELS_DIR = os.path.join('.', 'models')
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODELS_DIR = os.path.join(BASE_DIR, 'models')
 MODEL_FILES = {
     'Original SVM': 'metal_classifier_svm.joblib',
     'Feature-Engineered SVM': 'metal_classifier_svm_fe.joblib',
@@ -36,17 +38,34 @@ MODEL_FILES = {
 
 @st.cache_resource(show_spinner=False)
 def load_models():
+    """Load available models from MODELS_DIR; return dict name->estimator.
+    Adds per-file diagnostics so user can understand missing models scenario.
+    """
     loaded = {}
+    diagnostics = []
     for name, fname in MODEL_FILES.items():
         path = os.path.join(MODELS_DIR, fname)
         if os.path.exists(path):
             try:
                 loaded[name] = joblib.load(path)
+                diagnostics.append(f"✅ {fname} loaded")
             except Exception as e:
-                st.warning(f"Failed loading {fname}: {e}")
+                diagnostics.append(f"⚠️ {fname} error: {e}")
+        else:
+            diagnostics.append(f"❌ {fname} not found at {path}")
+    # Store diagnostics in session_state for potential display
+    st.session_state['model_load_report'] = diagnostics
     return loaded
 
 models = load_models()
+
+# -------------------- SESSION STATE INIT --------------------
+if 'frame_scenario' not in st.session_state:
+    st.session_state['frame_scenario'] = None
+if 'hm' not in st.session_state:
+    st.session_state['hm'] = None
+if 'proc' not in st.session_state:
+    st.session_state['proc'] = None
 
 # -------------------- SIDEBAR CONFIG --------------------
 st.sidebar.image("https://static.streamlit.io/logo.png", width=80)
@@ -58,6 +77,12 @@ snr_db = st.sidebar.slider("SNR dB", 4, 30, 18, 1, help="Higher SNR = cleaner si
 img_size = st.sidebar.selectbox("Image Size", ['64x64','128x64'], index=0)
 range_bins, doppler_bins = (64,64) if img_size=='64x64' else (128,64)
 model_choice = st.sidebar.selectbox("Model", list(models.keys()) if models else ["No models"], help="Choose detector variant.")
+if not models:
+    with st.sidebar.expander("Model Diagnostics"):
+        st.write("Models directory:", MODELS_DIR)
+        st.write("Load attempts:")
+        for line in st.session_state.get('model_load_report', []):
+            st.write(line)
 base_threshold = st.sidebar.slider("Decision Threshold", 0.0, 1.0, 0.50, 0.01, help="Probability cutoff for METAL.")
 use_hidden_mode = st.sidebar.checkbox("Hidden Focus (0.10)", help="Force threshold=0.10 to catch faint hidden targets.")
 adaptive_threshold = 0.10 if use_hidden_mode else base_threshold
@@ -85,7 +110,7 @@ with st.expander("Key Terms"):
     )
 
 # Simplified three tabs
-gen_tab, clf_tab, hidden_tab = st.tabs(["1. Create Frame","2. Metal Detection","3. Hidden Stress Test"])
+gen_tab, clf_tab, hidden_tab = st.tabs(["1. Create Frame","2. Metal Detection","3. Hidden Object Detection"])
 
 # Utility inference function
 def infer(model_name, model_obj, raw_hm, proc_hm):
@@ -101,10 +126,16 @@ def infer(model_name, model_obj, raw_hm, proc_hm):
 with gen_tab:
     st.subheader("Create Frame")
     st.caption("Generate synthetic radar-like frame. 'hidden' = faint stripe + weak blob. 'metal_object' = strong blob. 'clutter' = scattered weak blobs.")
-    generate_btn = st.button("Generate Frame")
-    if generate_btn or 'hm' not in locals():
-        hm = generate_range_doppler_heatmap(range_bins, doppler_bins, scenario=scenario, metal=metal_flag, clutter_level=clutter_level, snr_db=snr_db)
-        proc = denoise_background_subtract(hm, method='median', kernel_size=5)
+    generate_btn = st.button("Generate / Refresh Frame")
+    need_new = generate_btn or st.session_state['hm'] is None or st.session_state['frame_scenario'] != scenario
+    if need_new:
+        hm_new = generate_range_doppler_heatmap(range_bins, doppler_bins, scenario=scenario, metal=metal_flag, clutter_level=clutter_level, snr_db=snr_db)
+        proc_new = denoise_background_subtract(hm_new, method='median', kernel_size=5)
+        st.session_state['hm'] = hm_new
+        st.session_state['proc'] = proc_new
+        st.session_state['frame_scenario'] = scenario
+    hm = st.session_state['hm']
+    proc = st.session_state['proc']
     col1, col2 = st.columns(2)
     with col1:
         fig_r, ax_r = plt.subplots(figsize=(4,4))
@@ -129,31 +160,47 @@ with gen_tab:
     st.markdown("**Stats (Raw vs Processed)**")
     st.json({'raw': raw_stats, 'processed': proc_stats})
     st.caption("Raw = target blobs + clutter + noise (then normalized & lightly blurred). Processed = raw − median background to emphasize local peaks (candidate metallic returns).")
-    with st.expander("Interpret"):
-        st.markdown(
-            "Raw: target echoes + clutter + noise. Processed: peaks isolated. Strong tight blob ⇒ metal. Faint horizontal band ⇒ hidden. Scattered weak blobs ⇒ clutter."
-        )
-    with st.expander("What did these parameters do?"):
-        st.write(
-            f"Scenario: '{scenario}' determines number/type of blobs. Metal flag: {metal_flag} boosts amplitude. Clutter level adds speckle intensity ≈ {clutter_level}. SNR={snr_db} dB sets Gaussian noise std (lower SNR ⇒ noisier frame)."
-        )
-        st.write("Normalization rescales to 0..1 so feature distributions stay consistent across runs.")
+    # End generation tab content
 
 with clf_tab:
     st.subheader("Metal Detection")
-    if 'hm' not in locals():
+    if st.session_state['hm'] is None:
         st.info("Generate a frame in the Generation tab first.")
     else:
         model = models.get(model_choice)
+        hm = st.session_state['hm']
+        proc = st.session_state['proc']
         prob = infer(model_choice, model, hm, proc)
-        decision = prob >= adaptive_threshold
+        show_hidden_controls = use_hidden_mode or st.session_state.get('frame_scenario') == 'hidden'
+        if show_hidden_controls:
+            stripe_threshold = st.slider("Hidden Stripe Threshold", 0.5, 5.0, 1.2, 0.1, help="Heuristic stripe score cutoff; lower = more sensitive.")
+            stripe_metrics = hidden_stripe_score(proc)
+            stripe_score = stripe_metrics['score']
+        else:
+            stripe_metrics = None
+            stripe_score = 0.0
+        decision = (prob >= adaptive_threshold) or (show_hidden_controls and stripe_score >= (stripe_threshold if show_hidden_controls else 999))
         c1, c2, c3 = st.columns(3)
         c1.metric("Probability", f"{prob:.3f}")
         c2.metric("Threshold", f"{adaptive_threshold:.2f}")
         c3.metric("Decision", "METAL" if decision else "NON-METAL")
-        # Inline concise definitions
-        st.caption("Probability = model confidence metal is present. Threshold = cutoff; ≥ gives METAL. Hidden Focus forces threshold=0.10 for faint stripe recall.")
-        # Simple horizontal bar showing probability and threshold
+        st.caption("Probability = model confidence; METAL if probability ≥ threshold or hidden stripe score crosses cutoff (hidden mode).")
+        if stripe_metrics is not None:
+            st.markdown("**Hidden Stripe Heuristic**")
+            s1, s2, s3, s4 = st.columns(4)
+            s1.metric("Stripe Score", f"{stripe_metrics['score']:.2f}")
+            s2.metric("Peak z", f"{stripe_metrics['peak_z']:.2f}")
+            s3.metric("Band frac", f"{stripe_metrics['band_frac']:.2f}")
+            s4.metric("Contrast", f"{stripe_metrics['contrast']:.2f}")
+            st.caption("Stripe score combines peak prominence, band length and contrast; probability OR stripe triggers METAL.")
+            with st.expander("How stripe heuristic works"):
+                st.markdown(
+                    "We scan row intensities of the processed map, smooth them, then measure: \n"
+                    "- Peak z: strongest row intensity prominence vs global mean/std.\n"
+                    "- Band frac: longest contiguous run of elevated rows (stripe continuity).\n"
+                    "- Contrast: peak row vs surrounding neighborhood.\n"
+                    "Composite score = 0.5*peak_z + 0.3*(band_frac*10) + 0.2*contrast. Lower threshold increases sensitivity to faint stripes."
+                )
         fig_pb, ax_pb = plt.subplots(figsize=(4.5,0.5))
         ax_pb.barh([0], [prob], color='orange')
         ax_pb.axvline(adaptive_threshold, color='red', linestyle='--', label='Threshold')
@@ -162,7 +209,7 @@ with clf_tab:
         ax_pb.set_xlabel('Probability')
         ax_pb.legend(loc='upper right', fontsize=7)
         st.pyplot(fig_pb)
-        if 'Feature-Engineered' in model_choice and show_features:
+        if ('Feature-Engineered' in model_choice) and show_features:
             st.markdown("**Engineered Feature Vector**")
             fv = extract_features(hm, proc, k_top=10)
             labels = ['raw_mean','raw_std','raw_max','raw_energy','raw_frac>0.5','proc_mean','proc_std','proc_max','proc_energy','proc_frac>0.5'] + [f'top_{i+1}' for i in range(10)]
@@ -175,9 +222,13 @@ with clf_tab:
                     "- processed_*: same stats after background subtraction (higher target separation).\n"
                     "- top_k: strongest pixel intensities from processed map capturing peak prominence."
                 )
-        batch_count = st.slider("Batch test count", 5, 100, 25, 5, help="How many frames to simulate (same settings) to see probability spread.")
-        batch_btn = st.button("Batch Test")
-        if batch_btn:
+        show_batch = st.checkbox("Show batch probability distribution", value=False, help="Simulate multiple frames & visualize probability spread.")
+        if show_batch:
+            batch_count = st.slider("Batch test count", 5, 100, 25, 5, help="How many frames to simulate (same settings).")
+            batch_btn = st.button("Run Batch Simulation")
+        else:
+            batch_btn = False
+        if batch_btn and show_batch:
             model = models.get(model_choice)
             probs = []
             for _ in range(batch_count):
@@ -196,44 +247,91 @@ with clf_tab:
             st.caption("Suggested threshold = 20th percentile (≈ keep 80%). Lower = more recall; higher = fewer false alarms.")
 
 with hidden_tab:
-    st.subheader("Hidden Stress Test")
-    st.caption("Faint stripe + weak blob vs clutter. Gauge recall vs false alarms.")
-    lab_hidden = st.slider("Hidden metals", 10, 150, 50, 10)
-    lab_clutter = st.slider("Clutter non-metals", 10, 150, 50, 10)
-    run_hidden = st.button("Evaluate Hidden/Clutter")
-    if run_hidden:
+    st.subheader("Hidden Object Detection")
+    st.markdown("Single hidden frame detection and optional batch stress test.")
+    colh1, colh2 = st.columns(2)
+    with colh1:
+        hidden_snr = st.slider("Hidden Frame SNR (dB)", 4, 20, 8, 1)
+    with colh2:
+        hidden_clutter = st.slider("Hidden Clutter Level", 0.0, 0.5, 0.25, 0.01)
+    colt1, colt2 = st.columns(2)
+    with colt1:
+        hidden_prob_thr = st.slider("Probability Threshold (P_thr)", 0.0, 1.0, 0.10, 0.01)
+    with colt2:
+        hidden_stripe_thr = st.slider("Stripe Threshold (S_thr)", 0.5, 5.0, 1.20, 0.1)
+    detect_btn = st.button("Run Hidden Detection")
+    if detect_btn:
         model = models.get(model_choice)
-        probs_hidden = []
-        probs_clutter = []
-        for _ in range(lab_hidden):
-            hm_h = generate_range_doppler_heatmap(range_bins, doppler_bins, scenario='hidden', metal=True, clutter_level=0.25, snr_db=8)
-            proc_h = denoise_background_subtract(hm_h, method='median', kernel_size=5)
-            probs_hidden.append(infer(model_choice, model, hm_h, proc_h))
-        for _ in range(lab_clutter):
-            hm_c = generate_range_doppler_heatmap(range_bins, doppler_bins, scenario='clutter', metal=False, clutter_level=0.3, snr_db=8)
-            proc_c = denoise_background_subtract(hm_c, method='median', kernel_size=5)
-            probs_clutter.append(infer(model_choice, model, hm_c, proc_c))
-        ph = np.array(probs_hidden); pc = np.array(probs_clutter)
-        recall = float(np.mean(ph >= adaptive_threshold))
-        fpr = float(np.mean(pc >= adaptive_threshold))
-        c1, c2 = st.columns(2)
-        c1.metric("Hidden Recall", f"{recall*100:.1f}%")
-        c2.metric("Clutter FPR", f"{fpr*100:.1f}%")
-        # Confusion matrix style summary
-        tp = int(np.sum(ph >= adaptive_threshold))
-        fn = int(ph.shape[0] - tp)
-        fp = int(np.sum(pc >= adaptive_threshold))
-        tn = int(pc.shape[0] - fp)
-        st.markdown("**Counts (Hidden=Positive, Clutter=Negative)**")
-        st.json({"TP_hidden_detected": tp, "FN_hidden_missed": fn, "FP_clutter_false_alarm": fp, "TN_clutter_correct": tn})
-        fig_hd, ax_hd = plt.subplots(figsize=(6,3))
-        ax_hd.hist(ph, bins=15, alpha=0.6, label='Hidden')
-        ax_hd.hist(pc, bins=15, alpha=0.6, label='Clutter')
-        ax_hd.axvline(adaptive_threshold, color='red', label='Threshold')
-        ax_hd.set_xlabel('Probability'); ax_hd.set_ylabel('Count'); ax_hd.legend()
-        st.pyplot(fig_hd)
-        st.caption(f"Hidden Recall {recall*100:.1f}%, Clutter FPR {fpr*100:.1f}%. Lower threshold ⇒ ↑ recall & ↑ false alarms.")
-
-    # Note: Batch simulation moved to Classification tab; export removed for simplicity.
+        hm_hidden = generate_range_doppler_heatmap(range_bins, doppler_bins, scenario='hidden', metal=True, clutter_level=hidden_clutter, snr_db=hidden_snr)
+        proc_hidden = denoise_background_subtract(hm_hidden, method='median', kernel_size=5)
+        prob_hidden = infer(model_choice, model, hm_hidden, proc_hidden)
+        stripe_vals = hidden_stripe_score(proc_hidden)
+        stripe_score_hidden = stripe_vals['score']
+        decision_hidden = (prob_hidden >= hidden_prob_thr) or (stripe_score_hidden >= hidden_stripe_thr)
+        mc1, mc2, mc3 = st.columns(3)
+        mc1.metric("Probability", f"{prob_hidden:.3f}")
+        mc2.metric("Stripe Score", f"{stripe_score_hidden:.2f}")
+        mc3.metric("Decision", "METAL" if decision_hidden else "NON-METAL")
+        with st.expander("Hidden Frame Visuals"):
+            vc1, vc2 = st.columns(2)
+            with vc1:
+                fig_hr, ax_hr = plt.subplots(figsize=(4,4))
+                imhr = ax_hr.imshow(hm_hidden, origin='lower', aspect='auto', cmap='inferno'); ax_hr.set_title('Raw Hidden Heatmap'); plt.colorbar(imhr, ax=ax_hr, fraction=0.046, pad=0.04)
+                st.pyplot(fig_hr)
+            with vc2:
+                fig_hp, ax_hp = plt.subplots(figsize=(4,4))
+                imhp = ax_hp.imshow(proc_hidden, origin='lower', aspect='auto', cmap='inferno'); ax_hp.set_title('Processed Hidden Heatmap'); plt.colorbar(imhp, ax=ax_hp, fraction=0.046, pad=0.04)
+                st.pyplot(fig_hp)
+        with st.expander("Stripe Components"):
+            sc1, sc2, sc3 = st.columns(3)
+            sc1.metric("Peak z", f"{stripe_vals['peak_z']:.2f}")
+            sc2.metric("Band frac", f"{stripe_vals['band_frac']:.2f}")
+            sc3.metric("Contrast", f"{stripe_vals['contrast']:.2f}")
+            st.caption("Composite score = 0.5*peak_z + 0.3*(band_frac*10) + 0.2*contrast.")
+    with st.expander("Batch Stress Test (Hidden vs Clutter)"):
+        st.caption("Evaluate recall (hidden detected) vs false alarms (clutter misclassified). Uses same thresholds defined above.")
+        lab_hidden = st.slider("Hidden samples", 10, 150, 40, 10)
+        lab_clutter = st.slider("Clutter samples", 10, 150, 40, 10)
+        run_batch = st.button("Run Batch Stress Test")
+        show_hist = st.checkbox("Show probability histograms", value=True)
+        if run_batch:
+            model = models.get(model_choice)
+            p_hidden = []
+            p_clutter = []
+            s_hidden = []
+            s_clutter = []
+            for _ in range(lab_hidden):
+                hm_h = generate_range_doppler_heatmap(range_bins, doppler_bins, scenario='hidden', metal=True, clutter_level=hidden_clutter, snr_db=hidden_snr)
+                proc_h = denoise_background_subtract(hm_h, method='median', kernel_size=5)
+                p_hidden.append(infer(model_choice, model, hm_h, proc_h))
+                s_hidden.append(hidden_stripe_score(proc_h)['score'])
+            for _ in range(lab_clutter):
+                hm_c = generate_range_doppler_heatmap(range_bins, doppler_bins, scenario='clutter', metal=False, clutter_level=hidden_clutter, snr_db=hidden_snr)
+                proc_c = denoise_background_subtract(hm_c, method='median', kernel_size=5)
+                p_clutter.append(infer(model_choice, model, hm_c, proc_c))
+                s_clutter.append(hidden_stripe_score(proc_c)['score'])
+            p_hidden = np.array(p_hidden); p_clutter = np.array(p_clutter)
+            s_hidden = np.array(s_hidden); s_clutter = np.array(s_clutter)
+            hidden_detect = (p_hidden >= hidden_prob_thr) | (s_hidden >= hidden_stripe_thr)
+            clutter_false = (p_clutter >= hidden_prob_thr) | (s_clutter >= hidden_stripe_thr)
+            recall = float(hidden_detect.mean()); fpr = float(clutter_false.mean())
+            bc1, bc2 = st.columns(2)
+            bc1.metric("Hidden Recall", f"{recall*100:.1f}%")
+            bc2.metric("Clutter FPR", f"{fpr*100:.1f}%")
+            tp = int(hidden_detect.sum()); fn = int(lab_hidden - tp)
+            fp = int(clutter_false.sum()); tn = int(lab_clutter - fp)
+            st.json({"TP_hidden_detected": tp, "FN_hidden_missed": fn, "FP_clutter_false_alarm": fp, "TN_clutter_correct": tn})
+            if show_hist:
+                fig_hh, ax_hh = plt.subplots(figsize=(6,3))
+                ax_hh.hist(p_hidden, bins=15, alpha=0.5, label='Hidden P')
+                ax_hh.hist(p_clutter, bins=15, alpha=0.5, label='Clutter P')
+                ax_hh.axvline(hidden_prob_thr, color='red', label='P_thr')
+                ax_hh.set_xlabel('Probability'); ax_hh.legend(); st.pyplot(fig_hh)
+                fig_sh, ax_sh = plt.subplots(figsize=(6,3))
+                ax_sh.hist(s_hidden, bins=15, alpha=0.5, label='Hidden S')
+                ax_sh.hist(s_clutter, bins=15, alpha=0.5, label='Clutter S')
+                ax_sh.axvline(hidden_stripe_thr, color='purple', label='S_thr')
+                ax_sh.set_xlabel('Stripe Score'); ax_sh.legend(); st.pyplot(fig_sh)
+            st.caption("Adjust thresholds to balance recall vs false alarms. Lower values increase sensitivity.")
 
 st.footer = st.caption("© 2025 RadarGuru")
